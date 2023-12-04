@@ -245,20 +245,15 @@ fn main() {
             // Create a new electrum server, we need to block_on because `ElectrumServer::new` is `async`
             // but our main isn't, so we can't `.await` on it.
             let electrum_server = block_on(ElectrumServer::new(
+                self,
                 "0.0.0.0:50001",
                 wallet,
                 blockchain_state,
             ))
             .expect("Could not create an Electrum Server");
 
-            task::spawn(accept_loop(
-                electrum_server
-                    .listener
-                    .clone()
-                    .expect("Listener can't be none by this far"),
-                electrum_server.notify_tx.clone(),
-            ));
-            task::spawn(electrum_server.main_loop());
+            block_on(electrum_server.start());
+
             info!("Server running on: 0.0.0.0:50001");
             let _kill_signal = kill_signal.clone();
             ctrlc::set_handler(move || {

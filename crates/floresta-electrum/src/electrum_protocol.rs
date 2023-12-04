@@ -8,12 +8,14 @@ use floresta_watch_only::kv_database::KvDatabase;
 use floresta_watch_only::{AddressCache, CachedTransaction};
 use futures::{select, FutureExt};
 
-use async_std::sync::RwLock;
-use async_std::{
-    channel::{unbounded, Receiver, Sender},
-    io::BufReader,
+use tokio::io::AsyncBufReadExt;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    prelude::*,
+    sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        RwLock,
+    },
 };
 
 use bitcoin::hashes::{hex::ToHex, sha256};
@@ -29,17 +31,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// A client connected to the server
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct Peer {
     _addresses: HashSet<Script>,
-    stream: Option<Arc<TcpStream>>,
+    stream: Option<TcpStream>,
 }
 
 impl Peer {
     /// Send a message to the client, should be a serialized JSON
-    pub async fn write(&self, data: &[u8]) -> Result<(), std::io::Error> {
-        if let Some(stream) = &self.stream {
-            let mut stream = &**stream;
+    pub async fn write(self, data: &[u8]) -> Result<(), std::io::Error> {
+        if let Some(mut stream) = self.stream {
+            // let mut stream = &**stream;
             let _ = stream.write(data).await;
             let _ = stream.write('\n'.to_string().as_bytes()).await;
         }
@@ -47,7 +49,8 @@ impl Peer {
         Ok(())
     }
     /// Create a new peer from a stream
-    pub fn new(stream: Arc<TcpStream>) -> Self {
+    pub fn new(stream: TcpStream, id_count: u32, notify_channel: UnboundedSender<Message>) -> Self {
+        tokio::task::spawn(peer_loop(stream, id_count, notify_channel.clone()));
         Peer {
             _addresses: HashSet::new(),
             stream: Some(stream),
@@ -66,37 +69,43 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
     /// The peers are the clients connected to our server, we keep track of them
     /// using a unique id.
     pub peers: HashMap<u32, Arc<Peer>>,
-    /// The peer_accept channel is used to send peer related message to the main
-    /// thread.
-    pub peer_accept: Receiver<Message>,
+    /// The peer_accept channel is used to send messages received from peers
+    /// in the peer_loop to the main_loop so they can be handled.
+    pub peer_accept: UnboundedReceiver<Message>,
     /// The notify_tx channel is used to send notifications to the main thread.
-    pub notify_tx: Sender<Message>,
+    pub notify_tx: UnboundedSender<Message>,
     /// The peer_addresses is used to keep track of the addresses of each peer.
     /// We keep the script_hash and which peer has it, so we can notify the
     /// peers when a new transaction is received.
     pub peer_addresses: HashMap<sha256::Hash, Arc<Peer>>,
 }
+
+#[derive(Debug)]
 pub enum Message {
     /// A new peer just connected to the server
-    NewPeer((u32, Arc<Peer>)),
+    NewPeer(u32),
     /// Some peer just sent a message
     Message((u32, String)),
     /// A peer just disconnected
     Disconnect(u32),
 }
 
-impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
+impl<Blockchain: BlockchainInterface + std::marker::Sync + std::marker::Send>
+    ElectrumServer<Blockchain>
+{
     pub async fn new(
+        &self,
         address: &'static str,
         address_cache: Arc<RwLock<AddressCache<KvDatabase>>>,
         chain: Arc<Blockchain>,
     ) -> Result<ElectrumServer<Blockchain>, Box<dyn std::error::Error>> {
         let listener = Arc::new(TcpListener::bind(address).await?);
-        let (tx, rx) = unbounded();
+        let (tx, rx) = unbounded_channel();
         let unconfirmed = address_cache.read().await.find_unconfirmed().unwrap();
-        for tx in unconfirmed {
-            chain.broadcast(&tx).expect("Invalid chain");
+        for transaction in unconfirmed {
+            chain.broadcast(&transaction).expect("Invalid chain");
         }
+
         Ok(ElectrumServer {
             chain,
             address_cache,
@@ -107,6 +116,12 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             peer_addresses: HashMap::new(),
         })
     }
+
+    pub async fn start(&self) {
+        tokio::task::spawn(accept_loop(self.listener.unwrap(), self.notify_tx));
+        tokio::task::spawn(self.main_loop());
+    }
+
     /// Handle a request from a peer. All methods are defined in the electrum
     /// protocol.
     pub async fn handle_peer_request(
@@ -349,16 +364,16 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
     }
 
     pub async fn main_loop(mut self) -> Result<(), crate::error::Error> {
-        let (tx, mut rx) = unbounded::<Notification>();
+        let (tx, mut rx) = unbounded_channel::<Notification>();
         self.chain.subscribe(tx);
         loop {
             select! {
-                notification = rx.next().fuse() => {
+                notification = rx.recv().fuse() => {
                     if let Some(notification) = notification {
                         self.handle_notification(notification).await;
                     }
                 },
-                message = self.peer_accept.next().fuse() => {
+                message = self.peer_accept.recv().fuse() => {
                     if let Some(message) = message {
                         self.handle_message(message).await?;
                     }
@@ -468,39 +483,36 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         }
     }
 }
-/// Each peer get one reading loop
+/// Each peer gets one reading loop
 async fn peer_loop(
-    stream: Arc<TcpStream>,
+    stream: TcpStream,
     id: u32,
-    notify_channel: Sender<Message>,
+    notify_channel: UnboundedSender<Message>,
 ) -> Result<(), std::io::Error> {
-    let mut _stream = &*stream;
-    let mut lines = BufReader::new(_stream).lines();
-    while let Some(Ok(line)) = lines.next().await {
+    // let mut _stream = &*stream;
+    let mut lines = BufReader::new(stream).lines();
+    while let Some(line) = lines.next_line().await.unwrap() {
         notify_channel
             .send(Message::Message((id, line)))
-            .await
             .expect("Main loop is broken");
     }
     log!(Level::Info, "Lost a peer");
     notify_channel
         .send(Message::Disconnect(id))
-        .await
         .expect("Main loop is broken");
     Ok(())
 }
 
-pub async fn accept_loop(listener: Arc<TcpListener>, notify_channel: Sender<Message>) {
+/// Listens to new Tcp connections in a loop
+pub async fn accept_loop(listener: Arc<TcpListener>, notify_channel: UnboundedSender<Message>) {
     let mut id_count = 0;
     loop {
         if let Ok((stream, _addr)) = listener.accept().await {
             info!("New client connection");
-            let stream = Arc::new(stream);
-            async_std::task::spawn(peer_loop(stream.clone(), id_count, notify_channel.clone()));
-            let peer = Arc::new(Peer::new(stream));
+            // let stream = Arc::new(stream);
+            let peer = Arc::new(Peer::new(stream, id_count, notify_channel));
             notify_channel
                 .send(Message::NewPeer((id_count, peer)))
-                .await
                 .expect("Main loop is broken");
             id_count += 1;
         }

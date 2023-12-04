@@ -34,6 +34,7 @@ async-std = { version = "1.12.0", default-features = false, features = [
     "std",
     "futures-core",
 ] }
+tokio = { version = "1", features = ["full"] }
 floresta-common = { path = "../floresta-common", default-features = false }
 futures = "0.3.28"
 

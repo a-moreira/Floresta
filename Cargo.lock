@@ -723,6 +723,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "spin",
+ "tokio",
  "zstd",
 ]
 
@@ -766,6 +767,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "tokio",
  "toml",
 ]
 

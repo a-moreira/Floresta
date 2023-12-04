@@ -10,9 +10,9 @@ use super::{
 use crate::prelude::*;
 use crate::{read_lock, write_lock, Network};
 use alloc::{borrow::ToOwned, fmt::format, string::ToString, vec::Vec};
-use async_std::channel::Sender;
 #[cfg(feature = "bitcoinconsensus")]
 use bitcoin::bitcoinconsensus;
+use tokio::sync::mpsc::UnboundedSender;
 
 use bitcoin::{
     blockdata::constants::genesis_block,
@@ -42,7 +42,7 @@ pub struct ChainStateInner<PersistedState: ChainStore> {
     /// We may have more than one consumer, that access our data through [BlockchainInterface],
     /// they might need to be notified about new data coming in, like blocks. They do so by calling
     /// `subscribe` and passing a [async_std::channel::Sender]. We save all Senders here.
-    subscribers: Vec<Sender<Notification>>,
+    subscribers: Vec<UnboundedSender<Notification>>,
     /// Fee estimation for 1, 10 and 20 blocks
     fee_estimation: (f64, f64, f64),
     /// Are we in Initial Block Download?
@@ -423,7 +423,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         let inner = self.inner.read();
         let subs = inner.subscribers.iter();
         for client in subs {
-            let _ = client.send(what.clone()).await;
+            let _ = client.send(what.clone()).unwrap();
         }
     }
 
@@ -763,7 +763,7 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
         inner.best_block.rescan_index = Some(start_height);
         Ok(())
     }
-    fn subscribe(&self, tx: Sender<Notification>) {
+    fn subscribe(&self, tx: UnboundedSender<Notification>) {
         let mut inner = self.inner.write();
         inner.subscribers.push(tx);
     }

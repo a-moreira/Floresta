@@ -9,9 +9,9 @@ pub mod partial_chain;
 pub mod udata;
 
 use crate::{prelude::*, BestChain, BlockchainError, DatabaseError, DiskBlockHeader};
-use async_std::channel::Sender;
 use bitcoin::{hashes::sha256, Block, BlockHash, BlockHeader, OutPoint, Transaction, TxOut};
 use rustreexo::accumulator::{node_hash::NodeHash, proof::Proof};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// This trait is the main interface between our blockchain backend and other services.
 /// It'll be useful for transitioning from rpc to a p2p based node
@@ -35,7 +35,7 @@ pub trait BlockchainInterface {
     fn get_block_header(&self, hash: &BlockHash) -> Result<BlockHeader, Self::Error>;
     /// Register for receiving notifications for some event. Right now it only works for
     /// new blocks, but may work with transactions in the future too.
-    fn subscribe(&self, tx: Sender<Notification>);
+    fn subscribe(&self, tx: UnboundedSender<Notification>);
     /// Tells whether or not we are on ibd
     fn is_in_idb(&self) -> bool;
     /// Returns the list of unbroadcasted transactions.
